@@ -20,7 +20,7 @@ REGIONS = ('头面耳颈 / scalp 头皮','前躯干与两侧','背部','手臂�
 COVERAGE = ('pending','reviewed','not_photographed','needs_retake')
 MAX_FILE = 40*1024*1024
 MAX_PIXELS = 30_000_000
-MAX_BACKUP = 1024*1024*1024
+MAX_BACKUP = 16*1024*1024*1024
 MAX_MANIFEST = 10*1024*1024
 MAX_MEMBERS = 10000
 MAX_RECORDS = 100000
@@ -59,6 +59,9 @@ class Store:
         (self.root/'originals').mkdir(exist_ok=True)
         self.db=sqlite3.connect(self.root/'journal.sqlite3')
         self.db.row_factory=sqlite3.Row
+        if self.db.execute('PRAGMA user_version').fetchone()[0] > 1:
+            self.db.close()
+            raise ValueError('资料由更新版本创建，请使用新版应用打开')
         self.db.execute('PRAGMA foreign_keys=ON')
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, month TEXT UNIQUE NOT NULL, created TEXT NOT NULL);
@@ -67,6 +70,11 @@ class Store:
         CREATE TABLE IF NOT EXISTS observations(id TEXT PRIMARY KEY, mole_id TEXT NOT NULL REFERENCES moles(id), session_id TEXT NOT NULL REFERENCES sessions(id), photo_id TEXT NOT NULL REFERENCES photos(id), masks TEXT NOT NULL, measurement TEXT, status TEXT NOT NULL, notes TEXT NOT NULL, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS coverage(session_id TEXT NOT NULL REFERENCES sessions(id), region TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(session_id,region));
         CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY, observation_id TEXT REFERENCES observations(id), detail TEXT NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS drafts(mole_id TEXT NOT NULL REFERENCES moles(id), session_id TEXT NOT NULL REFERENCES sessions(id), photo_id TEXT NOT NULL REFERENCES photos(id), payload TEXT NOT NULL, updated TEXT NOT NULL, PRIMARY KEY(mole_id,session_id,photo_id));
+        CREATE INDEX IF NOT EXISTS photos_session_hash_role ON photos(session_id,hash,role);
+        CREATE INDEX IF NOT EXISTS observations_mole_session ON observations(mole_id,session_id,created);
+        CREATE INDEX IF NOT EXISTS observations_session ON observations(session_id);
+        PRAGMA user_version=1;
         ''')
         self.db.commit()
 
@@ -179,29 +187,88 @@ class Store:
     def missing(self,session):
         return [r['id'] for r in self.rows('SELECT id FROM moles WHERE id NOT IN (SELECT mole_id FROM observations WHERE session_id=?) ORDER BY created,id',(session,))]
 
+    def monthly_status(self, session):
+        return {r['mole_id']: r['status'] for r in self.rows(
+            'SELECT mole_id,status FROM observations WHERE session_id=? ORDER BY created,rowid', (session,))}
+
+    def save_draft(self, mole, session, photo, payload):
+        for table, key in [('moles', mole), ('sessions', session), ('photos', photo)]:
+            self._exists(table, key)
+        photo_row = self.rows('SELECT * FROM photos WHERE id=?', (photo,))[0]
+        if photo_row['session_id'] != session:
+            raise ValueError('草稿照片与月份不一致')
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        if not isinstance(payload, dict) or len(encoded.encode('utf-8')) > 1024*1024:
+            raise ValueError('草稿内容无效或过大')
+        if (not isinstance(payload.get('masks'), dict) or
+                not isinstance(payload.get('notes'), str) or len(payload['notes']) > 5000 or
+                type(payload.get('mode')) is not int or payload['mode'] not in range(5) or
+                any(type(payload.get(key)) is not bool for key in ('srgb','ordinary'))):
+            raise ValueError('草稿字段无效')
+        points = payload.get('points')
+        if (not isinstance(points,list) or any(not isinstance(p,list) or len(p)!=2 or
+                any(type(v) not in (int,float) for v in p) or
+                not (0<=p[0]<photo_row['width'] and 0<=p[1]<photo_row['height']) for p in points)):
+            raise ValueError('草稿未完成标记无效')
+        # Drafts can be unfinished, but completed shapes still use the shared domain gate.
+        validate_observation('uncalibrated',payload['masks'],None,photo_row,session)
+        if payload.get('profile') is not None:
+            from .color import reference_xyz
+            reference_xyz(payload['profile'])
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO drafts VALUES (?,?,?,?,?)',
+                            (mole, session, photo, encoded, now()))
+
+    def load_draft(self, mole, session, photo):
+        rows = self.rows('SELECT payload FROM drafts WHERE mole_id=? AND session_id=? AND photo_id=?',
+                         (mole, session, photo))
+        return json.loads(rows[0]['payload']) if rows else None
+
+    def clear_draft(self, mole, session, photo):
+        with self.db:
+            self.db.execute('DELETE FROM drafts WHERE mole_id=? AND session_id=? AND photo_id=?',
+                            (mole, session, photo))
+
+    def backup_capacity(self):
+        photos = self.rows('SELECT DISTINCT hash FROM photos')
+        total = sum((self.root/'originals'/p['hash']).stat().st_size for p in photos)
+        return {'photos': len(photos), 'original_bytes': total, 'limit_bytes': MAX_BACKUP}
+
     def backup(self,path):
         path=Path(path)
         if path.exists():raise ValueError('备份文件已存在；请选择新文件名')
-        data={'format':1,'tables':{t:self.rows(f'SELECT * FROM {t}') for t in TABLES}}
+        # Explicit read transaction gives all tables the same SQLite snapshot.
+        self.db.execute('BEGIN')
+        try:
+            data={'format':1,'tables':{t:self.rows(f'SELECT * FROM {t}') for t in TABLES},
+                  'drafts': self.rows('SELECT * FROM drafts')}
+        finally:
+            self.db.rollback()
         if any(len(rows)>MAX_RECORDS for rows in data['tables'].values()):
             raise ValueError('备份记录数超过本版本恢复限制；未发布备份')
+        photos = {p['id']: p for p in data['tables']['photos']}
         for observation in data['tables']['observations']:
-            photo=self.rows('SELECT * FROM photos WHERE id=?',(observation['photo_id'],))[0]
+            photo=photos[observation['photo_id']]
             validate_observation(observation['status'],json.loads(observation['masks']),
                 json.loads(observation['measurement']) if observation['measurement'] else None,photo,observation['session_id'])
         hashes={r['hash'] for r in data['tables']['photos']}
         manifest=json.dumps(data,ensure_ascii=False,allow_nan=False).encode('utf-8')
         sizes=[len(manifest)]+[(self.root/'originals'/digest).stat().st_size for digest in hashes]
         check_backup_limits(len(sizes),sum(sizes),len(manifest))
+        if shutil.disk_usage(path.parent).free < sum(sizes) * 1.02 + 1024*1024:
+            raise ValueError('备份目标可用空间不足，请选择其他磁盘')
         # Validate before publishing a backup; interrupted writes never replace existing data.
         with tempfile.NamedTemporaryFile(dir=path.parent,suffix='.tmp',delete=False) as tmp:temp=Path(tmp.name)
         try:
             with zipfile.ZipFile(temp,'w',compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr('manifest.json',manifest)
                 for digest in sorted(hashes):
-                    raw=(self.root/'originals'/digest).read_bytes()
-                    if hashlib.sha256(raw).hexdigest()!=digest:raise ValueError('原件校验失败，备份已中止')
-                    archive.writestr('originals/'+digest,raw)
+                    checksum=hashlib.sha256()
+                    with (self.root/'originals'/digest).open('rb') as source, archive.open('originals/'+digest,'w',force_zip64=True) as output:
+                        while chunk := source.read(1024*1024):
+                            checksum.update(chunk)
+                            output.write(chunk)
+                    if checksum.hexdigest()!=digest:raise ValueError('原件校验失败，备份已中止')
             temp.replace(path)
         finally:
             if temp.exists():temp.unlink()
@@ -209,7 +276,7 @@ class Store:
 
 def check_backup_limits(members, total_bytes, manifest_bytes):
     if members > MAX_MEMBERS or total_bytes > MAX_BACKUP or manifest_bytes > MAX_MANIFEST:
-        raise ValueError('备份超出本版本可恢复限制（解压后 1 GiB、10000 文件、清单 10 MiB）。未发布备份；请保留资料目录的离线副本，勿删除原件')
+        raise ValueError('备份超出本版本可恢复限制（解压后 16 GiB、10000 文件、清单 10 MiB）。未发布备份；请保留资料目录的离线副本，勿删除原件')
 
 
 def restore_backup(source,destination):
@@ -231,6 +298,8 @@ def restore_backup(source,destination):
         if any(not isinstance(h,str) or not re.fullmatch('[a-f0-9]{64}',h) for h in hashes):raise ValueError('照片哈希无效')
         if set(names)!={'manifest.json'}|{'originals/'+h for h in hashes}:raise ValueError('备份包含未知文件或缺少原件')
         destination.parent.mkdir(parents=True,exist_ok=True)
+        if shutil.disk_usage(destination.parent).free < sum(e.file_size for e in entries)*1.02 + 20*1024*1024:
+            raise ValueError('恢复目标可用空间不足')
         staging=Path(tempfile.mkdtemp(prefix='.mole-restore-',dir=destination.parent))
         restored=None
         try:
@@ -261,6 +330,11 @@ def restore_backup(source,destination):
             for p in restored.rows('SELECT * FROM photos'):
                 w,h,_=validate_image(restored.photo_path(p['id']).read_bytes())
                 if (w,h)!=(p['width'],p['height']) or p['role'] not in ('detail','overview'):raise ValueError('备份照片元数据无效')
+            drafts = data.get('drafts', [])
+            if not isinstance(drafts, list) or len(drafts) > MAX_RECORDS:
+                raise ValueError('备份草稿无效')
+            for draft in drafts:
+                restored.save_draft(draft['mole_id'], draft['session_id'], draft['photo_id'], json.loads(draft['payload']))
             restored.close();restored=None
             staging.rename(destination)
         except (sqlite3.Error,KeyError,TypeError,json.JSONDecodeError) as exc:

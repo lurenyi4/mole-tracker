@@ -21,3 +21,7 @@ Review the entire project, not only latest diff. Run `python -m unittest -v` and
 - [ ] Comparison failures clear all displayed results, failed month creation retains dirty protection, coverage remains scrollable with larger fonts and status remains visible
 - [ ] Explicit null/malformed capture context rejects save/restore, while genuinely absent legacy context loads safely
 - [ ] New-ID cancel, invalid input and storage failure retain current identity, masks, notes and dirty protection; success alone commits the transition
+- [ ] Draft restoration reads the latest saved edit and resets human QC; same-tool selection retains unfinished points
+- [ ] Run the entire native suite in one process to check Tk/worker cleanup, not only separate modules
+- [ ] Check latest monthly status after month changes, history loads and identity correction; retain all historical versions
+- [ ] Verify uint8 and float sample equivalence, backup snapshot/streaming limits and separate documented physical capacity tests

@@ -105,3 +105,11 @@ The sections above describe the original Linux source delivery and its historica
 - Preserve the local `MoleJournal/` database and exclude it from Git, along with tool/test caches and local secrets. No photos or database files are part of the upload.
 - Windows validation before removing the virtual environment: Python 3.13, Pillow 12.3.0, NumPy 2.3.5; `python -B -X utf8 -m unittest -v`: 39 passed, zero skipped, 4.217 s. Without UTF-8 mode one GUI test raises `UnicodeDecodeError` while reading its generated JSON under default GBK; documented the UTF-8 command without changing code.
 - Update launch paths and current verification boundaries. No fresh independent code-review claim is made for this documentation/file-management task. Recreate `.venv` from requirements before running the application again.
+
+## 2026-10-05 reliability and usability repairs
+
+The user requested direct implementation by the primary agent. No implementation was delegated. Added failing regressions, then implemented byte-raster sample normalization, isolated worker tasks, recoverable drafts, monthly latest-state navigation, bounded streaming backups and additive schema/index setup. Preserved originals, previous observations and the private local journal.
+
+Round-one independent review found current-draft overwrite, same-tool point loss, Tk worker/GC teardown failure and stale monthly labels. Fixed these directly and added regression coverage. A new independent reviewer passed focused verification and the full Spec / Standards audit; no blocker/critic/major or mandatory simplification remains. Full Windows suite: 46 passed, zero skipped. Test cleanup used the Windows Recycle Bin helper through an external runner.
+
+Reviewed every existing docs file: updated validation, requirements, color allocation, review checklist and release notes; capture protocol and physical-reference setup retain their applicable instructions. Updated README and quickstart. No ADR modified. Real 16 GiB/disk-full tests, large-image peak memory, long-duration thread stability, real device/card repeatability, thumbnail selection, vertex dragging and task cancellation remain future work. No installer build or medical validation claim.

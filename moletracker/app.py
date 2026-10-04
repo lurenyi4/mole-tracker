@@ -1,5 +1,7 @@
 """Native, offline Tk application. All image coordinates refer to stored raster."""
 import argparse
+import gc
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 import json
 from pathlib import Path
@@ -26,6 +28,7 @@ class PhotoCanvas(ttk.Frame):
         self.canvas.grid(row=0,column=0,sticky='nsew');sy.grid(row=0,column=1,sticky='ns');sx.grid(row=1,column=0,sticky='ew')
         self.rowconfigure(0,weight=1);self.columnconfigure(0,weight=1)
         self.original=None;self.patch_names=[];self.scale=1.;self.mode=0;self.points=[];self.masks={};self.start=None
+        self.locked=False
         self.canvas.bind('<Button-1>',self.click)
         self.canvas.bind('<B1-Motion>',self.drag)
         self.canvas.bind('<ButtonRelease-1>',self.release)
@@ -81,18 +84,21 @@ class PhotoCanvas(ttk.Frame):
         w,h=self.original.size
         return [max(0,min(w-1,self.canvas.canvasx(event.x)/self.scale)),max(0,min(h-1,self.canvas.canvasy(event.y)/self.scale))]
     def click(self,event):
-        if self.original is None:return
+        if self.original is None or self.locked:return
         if self.mode==0:self.canvas.scan_mark(event.x,event.y)
         elif self.mode==4:self.start=self.coords(event)
         else:self.points.append(self.coords(event));self.outlines();self.changed()
     def drag(self,event):
+        if self.locked:return
         if self.mode==0:self.canvas.scan_dragto(event.x,event.y,gain=1)
     def release(self,event):
+        if self.locked:return
         if self.original is not None and self.mode==4 and self.start:
             end=self.coords(event);x,y=self.start
             self.masks.setdefault('patches',[]).append([min(x,end[0]),min(y,end[1]),max(x,end[0]),max(y,end[1])])
             self.start=None;self.outlines();self.changed()
     def finish(self):
+        if self.locked:return
         if self.mode not in (1,2,3) or len(self.points)<3:return
         if self.mode==3:self.masks.setdefault('exclude',[]).append(self.points[:])
         else:self.masks['mole' if self.mode==1 else 'skin']=self.points[:]
@@ -101,15 +107,23 @@ class PhotoCanvas(ttk.Frame):
         if self.points:self.points.pop()
         elif self.mode==4 and self.masks.get('patches'):self.masks['patches'].pop()
         elif self.mode==3 and self.masks.get('exclude'):self.masks['exclude'].pop()
-        elif self.mode in (1,2):self.masks['mole' if self.mode==1 else 'skin']=[]
+        elif self.mode in (1,2):
+            key='mole' if self.mode==1 else 'skin'
+            self.points=self.masks.get(key,[])[:-1]
+            self.masks[key]=[]
         self.outlines();self.changed()
     def set_mode(self,mode):
+        if mode == self.mode:return
+        if self.points and mode != self.mode:
+            raise ValueError('请先完成多边形或撤销未完成的点，再切换标记工具')
         self.points=[];self.mode=mode;self.outlines()
 
 
 class App:
     def __init__(self,root,store):
         self.root=root;self.store=store;self.session=None;self.photo=None;self.mole=None;self.dirty=False;self.profile=None
+        self.busy=False;self.draft_timer=None;self.job_timer=None
+        self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='mole-work')
         root.title('痣迹 · 本地照片记录');root.geometry('1400x900');root.minsize(1100,760)
         family=next((f for f in ('Noto Sans CJK SC','Microsoft YaHei','PingFang SC') if f in tkfont.families(root)), 'sans-serif')
         for name in ('TkDefaultFont','TkTextFont','TkMenuFont','TkHeadingFont','TkCaptionFont'):
@@ -119,7 +133,7 @@ class App:
         style.configure('Title.TLabel',font=(family,18,'bold'))
         head=ttk.Frame(root,padding=12);head.pack(fill='x')
         ttk.Label(head,text='痣迹  /  私密本地照片日志',style='Title.TLabel').pack(side='left')
-        for label,command in [('拍摄协议',self.guide),('备份到本地',self.backup),('恢复副本',self.restore)]:
+        for label,command in [('拍摄协议',self.guide),('备份到本地',self.backup),('恢复副本',self.restore),('恢复编辑草稿',self.restore_draft)]:
             ttk.Button(head,text=label,command=lambda c=command:self.safe(c)).pack(side='right',padx=3)
         tk.Label(root,text='不提供诊断或健康保证。新出现、变化、瘙痒或出血不要等到下个月，请及时咨询皮肤科。',bg='#fff0da',fg='#633e15',pady=8).pack(fill='x')
         self.status=tk.StringVar(value='照片只在本机保存。原件含 EXIF / 位置等元数据；备份未加密，请存放在非同步安全目录。')
@@ -130,14 +144,101 @@ class App:
         self.tabs.add(self.editor,text='  1  导入与标记  ');self.tabs.add(self.review,text='  2  历史与对比  ');self.tabs.add(self.cover,text='  3  覆盖清单  ')
         self.build_editor();self.build_review();self.build_coverage()
         root.protocol('WM_DELETE_WINDOW',self.close)
+        root.bind('<Destroy>', self.cleanup, add='+')
         self.refresh_sessions();self.refresh_moles()
+        if self.store.rows('SELECT 1 FROM drafts LIMIT 1'):
+            self.status.set('发现未完成的编辑，可点击「恢复编辑草稿」继续；正式观察未被改动。')
 
     def safe(self,fn):
         try:return fn()
         except Exception as exc:messagebox.showerror('未完成',str(exc),parent=self.root)
-    def mark_dirty(self):self.dirty=True
+    def mark_dirty(self):
+        self.dirty=True
+        if self.draft_timer:return
+        self.draft_timer=self.root.after(400,self.autosave_draft)
+
+    def cleanup(self,event):
+        if event.widget is self.root:
+            if self.draft_timer:
+                self.root.after_cancel(self.draft_timer);self.draft_timer=None
+            if self.job_timer:
+                self.root.after_cancel(self.job_timer);self.job_timer=None
+            self.executor.shutdown(wait=True)
+
+    def autosave_draft(self):
+        self.draft_timer=None
+        try:self.flush_draft()
+        except Exception as exc:self.status.set('草稿尚未保存：'+str(exc))
+
+    def flush_draft(self):
+        if self.draft_timer:
+            self.root.after_cancel(self.draft_timer);self.draft_timer=None
+        if self.dirty and self.mole and self.session and self.photo:
+            self.store.save_draft(self.mole,self.session,self.photo,{
+                'masks':self.canvas.masks,'points':self.canvas.points,'mode':self.canvas.mode,
+                'notes':self.notes.get('1.0','end-1c'),'profile':self.profile,
+                'srgb':self.srgb.get(),'ordinary':self.ordinary.get()})
+
+    def restore_draft(self):
+        self.flush_draft()
+        rows=self.store.rows('SELECT d.*,m.location,s.month FROM drafts d JOIN moles m ON m.id=d.mole_id JOIN sessions s ON s.id=d.session_id ORDER BY d.updated DESC')
+        if not rows:raise ValueError('没有可恢复的草稿')
+        dialog=tk.Toplevel(self.root);dialog.title('恢复编辑草稿');dialog.transient(self.root);dialog.grab_set()
+        choices=tk.Listbox(dialog,width=65,height=min(12,len(rows)),exportselection=False)
+        choices.pack(padx=15,pady=15)
+        for row in rows:choices.insert('end',row['month']+' · '+row['location']+' · '+row['photo_id'][:8])
+        choices.selection_set(0)
+        def restore():
+            row=rows[choices.curselection()[0]]
+            if not self.discard():return
+            payload=self.store.load_draft(row['mole_id'],row['session_id'],row['photo_id'])
+            if payload is None:raise ValueError('草稿已保存为正式记录，请重新打开草稿列表')
+            if payload.get('profile'):reference_xyz(payload['profile'])
+            self.canvas.load(self.store.photo_path(row['photo_id']),payload['masks'])
+            self.session=row['session_id'];self.mole=row['mole_id'];self.photo=row['photo_id']
+            self.reset_qc()
+            self.profile=payload.get('profile')
+            self.profile_label.set(self.profile['name'] if self.profile else '未载入参考配置')
+            self.canvas.patch_names=self.profile.get('patch_ids',[]) if self.profile else []
+            self.canvas.points=payload.get('points',[]);self.canvas.mode=payload.get('mode',0)
+            self.mode.current(self.canvas.mode);self.canvas.outlines()
+            self.notes.insert('1.0',payload.get('notes',''))
+            self.srgb.set(payload.get('srgb',False));self.ordinary.set(payload.get('ordinary',True))
+            self.refresh_sessions();self.refresh_moles();self.mark_dirty();self.tabs.select(self.editor)
+            self.status.set('编辑草稿已恢复，请重新检查全部人工质控后保存。');dialog.destroy()
+        ttk.Button(dialog,text='恢复所选草稿',command=lambda:self.safe(restore)).pack(pady=10)
+
+    def run_job(self,label,work,complete):
+        if self.busy:raise ValueError('请等待当前任务完成')
+        # Tk keeps callback cycles after destroyed windows. Collect them on their
+        # owning thread before a worker's allocations can trigger cyclic GC.
+        gc.collect()
+        self.flush_draft();self.busy=True;self.canvas.locked=True
+        disabled=[]
+        def lock(widget):
+            for child in widget.winfo_children():
+                if 'state' in child.keys():
+                    try:
+                        previous=child.cget('state');child.configure(state='disabled');disabled.append((child,previous))
+                    except tk.TclError:pass
+                lock(child)
+        lock(self.root);self.status.set(label+'，请稍候…')
+        future=self.executor.submit(work)
+        def poll():
+            self.job_timer=None
+            if not future.done():self.job_timer=self.root.after(50,poll);return
+            self.busy=False;self.canvas.locked=False
+            for widget,previous in disabled:
+                if widget.winfo_exists():widget.configure(state=previous)
+            try:complete(future.result())
+            except Exception as exc:
+                self.status.set(label+'未完成；原记录和编辑草稿保留。')
+                messagebox.showerror('未完成',str(exc),parent=self.root)
+        self.job_timer=self.root.after(50,poll)
+
     def discard(self):
-        if self.dirty and not messagebox.askyesno('未保存标记','切换会丢弃未保存的标记，继续吗？',parent=self.root):return False
+        self.flush_draft()
+        if self.dirty and not messagebox.askyesno('未保存标记','切换后本次编辑保留为恢复草稿，不会成为正式观察。继续吗？',parent=self.root):return False
         return True
     def selected(self,widget,rows):
         indices=widget.curselection();return rows[indices[0]] if indices else None
@@ -154,6 +255,7 @@ class App:
         row=ttk.Frame(side);row.pack(fill='x',pady=5)
         ttk.Button(row,text='＋ 新记录',command=lambda:self.safe(self.add_mole)).pack(side='left')
         ttk.Button(row,text='修改位置',command=lambda:self.safe(self.edit_mole)).pack(side='left')
+        ttk.Button(side,text='下一处未记录 / 待重拍',command=lambda:self.safe(self.next_pending)).pack(fill='x')
         ttk.Label(side,text='本月照片 · 概览用于定位，近照用于数值').pack(anchor='w',pady=(10,3))
         self.photo_list=tk.Listbox(side,height=5,exportselection=False);self.photo_list.pack(fill='both',expand=True)
         self.photo_list.bind('<<ListboxSelect>>',lambda e:self.safe(self.select_photo))
@@ -163,7 +265,7 @@ class App:
         main=ttk.Frame(self.editor);main.pack(side='left',fill='both',expand=True)
         bar=ttk.Frame(main);bar.pack(fill='x')
         self.mode=ttk.Combobox(bar,values=MODE_NAMES,state='readonly',width=25);self.mode.current(0);self.mode.pack(side='left')
-        self.mode.bind('<<ComboboxSelected>>',lambda e:self.canvas.set_mode(self.mode.current()))
+        self.mode.bind('<<ComboboxSelected>>',lambda e:self.safe(self.change_mode))
         for label,command in [('完成多边形',lambda:self.canvas.finish()),('撤销',lambda:self.canvas.undo()),('−',lambda:self.canvas.zoom(.8)),('＋',lambda:self.canvas.zoom(1.25)),('适合',lambda:self.canvas.fit())]:
             ttk.Button(bar,text=label,command=command).pack(side='left',padx=2)
         ttk.Label(main,text='左键逐点标记，完成多边形；色卡用拖动矩形。浏览模式拖动平移。原始方向显示，不自动旋转。').pack(anchor='w',pady=5)
@@ -235,21 +337,35 @@ class App:
         index=self.month_combo.current()
         if not self.discard():
             self.month_combo.current(next(i for i,r in enumerate(self.session_rows) if r['id']==self.session));return
-        self.session=self.session_rows[index]['id'];self.photo=None;self.clear_canvas();self.refresh_photos();self.refresh_coverage()
+        self.session=self.session_rows[index]['id'];self.photo=None;self.clear_canvas();self.refresh_photos();self.refresh_moles()
     def new_session(self):
         month=simpledialog.askstring('新建月份','月份 YYYY-MM',initialvalue=date.today().strftime('%Y-%m'),parent=self.root)
-        if month and self.discard():self.session=self.store.create_session(month);self.photo=None;self.clear_canvas();self.refresh_sessions()
+        if month and self.discard():self.session=self.store.create_session(month);self.photo=None;self.clear_canvas();self.refresh_sessions();self.refresh_moles()
     def require_session(self):
         if not self.session:raise ValueError('请先新建或选择月份')
         return self.session
     def refresh_moles(self):
         self.mole_rows=self.store.moles();self.mole_list.delete(0,'end')
-        for row in self.mole_rows:self.mole_list.insert('end',row['id'][:8]+' · '+row['location'])
+        statuses=self.store.monthly_status(self.session) if self.session else {}
+        for row in self.mole_rows:self.mole_list.insert('end',row['id'][:8]+' · '+row['location']+' · '+STATUS_NAMES.get(statuses.get(row['id']),'本月未记录'))
         if self.mole:
             for i,row in enumerate(self.mole_rows):
                 if row['id']==self.mole:self.mole_list.selection_set(i)
         self.refresh_history()
         if self.session:self.refresh_coverage()
+    def change_mode(self):
+        try:self.canvas.set_mode(self.mode.current())
+        finally:self.mode.current(self.canvas.mode)
+
+    def next_pending(self):
+        self.require_session()
+        statuses=self.store.monthly_status(self.session)
+        indices=[i for i,row in enumerate(self.mole_rows) if statuses.get(row['id']) in (None,'retake')]
+        if not indices:raise ValueError('本月所有 ID 已有记录；请继续核对覆盖清单')
+        current=next((i for i,row in enumerate(self.mole_rows) if row['id']==self.mole),-1)
+        index=next((i for i in indices if i>current),indices[0])
+        self.mole_list.selection_clear(0,'end');self.mole_list.selection_set(index);self.mole_list.see(index)
+        self.select_mole()
     def select_mole(self):
         row=self.selected(self.mole_list,self.mole_rows)
         if row and row['id']!=self.mole:
@@ -286,12 +402,21 @@ class App:
     def import_photos(self,role):
         self.require_session()
         files=filedialog.askopenfilenames(parent=self.root,title='选择 USB / 本地原件，不会上传',filetypes=[('JPEG / PNG','*.jpg *.jpeg *.png'),('所有文件','*')])
-        count=0;errors=[]
-        for file in files:
-            try:self.store.import_photo(file,self.session,role);count+=1
-            except ValueError as exc:errors.append(str(exc))
-        self.refresh_photos();self.status.set(f'导入 {count} 张原件；失败 {len(errors)} 张。未上传。')
-        if errors:messagebox.showwarning('部分文件未导入','\n'.join(errors[:5]),parent=self.root)
+        if not files:return
+        session=self.session;data_root=self.store.root
+        def work():
+            store=Store(data_root);count=0;errors=[]
+            try:
+                for file in files:
+                    try:store.import_photo(file,session,role);count+=1
+                    except (ValueError,OSError) as exc:errors.append(Path(file).name+'：'+str(exc))
+                return count,errors
+            finally:store.close()
+        def complete(result):
+            count,errors=result
+            self.refresh_photos();self.status.set(f'导入 {count} 张原件；失败 {len(errors)} 张。未上传。')
+            if errors:messagebox.showwarning('部分文件未导入','\n'.join(errors[:5]),parent=self.root)
+        self.run_job('导入照片',work,complete)
     def select_photo(self):
         row=self.selected(self.photo_list,self.photo_rows)
         if not row or row['id']==self.photo:
@@ -352,18 +477,23 @@ class App:
         masks=json.loads(json.dumps(self.canvas.masks));masks['coordinate_system']='original-unrotated-raster'
         masks['capture_context']={'srgb_assumed':self.srgb.get(),'ordinary_skin':self.ordinary.get()}
         self.store.save_observation(self.mole,self.session,self.photo,masks,measurement,status,notes)
-        self.dirty=False;self.refresh_history();self.refresh_coverage();self.status.set('已保存新的观察；原件和旧记录均保留。')
+        self.store.clear_draft(self.mole,self.session,self.photo)
+        self.dirty=False;self.refresh_moles();self.status.set('已保存新的观察；原件和旧记录均保留。')
     def save_comparable(self):
         self.require_record()
         if not self.profile:raise ValueError('尚未选择可信色卡配置；请先准备实物色卡与配置。没有配置时可保存未校准照片')
         if not all(v.get() for v in self.qc):raise ValueError('请逐项检查质控；发现问题应重新拍摄，不要勾选不符合的项目')
-        image,space=analysis_image(self.store.photo_path(self.photo),self.srgb.get())
-        masks=self.canvas.masks;size=(image.shape[1],image.shape[0]);exclude=masks.get('exclude',[])
-        mole=polygon_mask(size,masks.get('mole',[]),exclude)
-        skin=polygon_mask(size,masks.get('skin',[]),exclude) if self.ordinary.get() else None
-        fit=fit_reference(patch_medians(image,masks.get('patches',[])),self.profile)
-        result=measure(image,mole,skin,fit,self.ordinary.get());result['color_source']=space;result['manual_qc']=[True]*4
-        self.record(result,'comparable',self.notes.get('1.0','end').strip())
+        path=self.store.photo_path(self.photo);srgb=self.srgb.get();ordinary=self.ordinary.get()
+        masks=json.loads(json.dumps(self.canvas.masks));profile=self.profile;notes=self.notes.get('1.0','end').strip()
+        def work():
+            image,space=analysis_image(path,srgb)
+            size=(image.shape[1],image.shape[0]);exclude=masks.get('exclude',[])
+            mole=polygon_mask(size,masks.get('mole',[]),exclude)
+            skin=polygon_mask(size,masks.get('skin',[]),exclude) if ordinary else None
+            fit=fit_reference(patch_medians(image,masks.get('patches',[])),profile)
+            result=measure(image,mole,skin,fit,ordinary);result['color_source']=space;result['manual_qc']=[True]*4
+            return result
+        self.run_job('分析所选区域',work,lambda result:self.record(result,'comparable',notes))
     def save_photo_only(self):
         self.require_record()
         notes=self.notes.get('1.0','end').strip()
@@ -374,8 +504,9 @@ class App:
     def refresh_coverage(self):
         for region,state in self.store.coverage(self.session).items():self.cover_vars[region].current(COVERAGE.index(state))
         missing=self.store.missing(self.session)
-        observations=self.store.rows('SELECT status,COUNT(*) AS n FROM observations WHERE session_id=? GROUP BY status',(self.session,))
-        self.cover_summary.set(f'已登记 {len(self.store.moles())} 个稳定 ID；本月尚无照片观察 {len(missing)} 个：'+', '.join(m[:8] for m in missing)+'\n本月观察记录：'+', '.join(f'{STATUS_NAMES[r["status"]]}: {r["n"]}' for r in observations)+'\n已有照片也可能仍需要重拍，不等于已获得可比较记录。')
+        statuses=list(self.store.monthly_status(self.session).values())
+        locations={m['id']:m['location'] for m in self.store.moles()}
+        self.cover_summary.set(f'已登记 {len(locations)} 个稳定 ID；本月尚无照片观察 {len(missing)} 个：'+', '.join(locations[m] for m in missing)+'\n本月每个 ID 最新状态：'+', '.join(f'{label}: {statuses.count(status)}' for status,label in STATUS_NAMES.items())+'\n已有照片也可能仍需要重拍，不等于已获得可比较记录。')
     def refresh_history(self):
         if not hasattr(self,'history'):return
         self.comparison.set(('当前 ID：'+self.mole+' · 按 Ctrl / Command 选择两条记录') if self.mole else '请先在工作台选择一个稳定 ID')
@@ -430,6 +561,7 @@ class App:
         self.session=row['session_id']
         self.photo=row['photo_id']
         self.refresh_sessions()
+        self.refresh_moles()
         self.reset_qc()
         self.notes.insert('1.0',row['notes'])
         self.dirty=True
@@ -444,6 +576,9 @@ class App:
             self.canvas.outlines()
             self.ordinary.set(measurement['ordinary_skin'])
             self.srgb.set(measurement['color_source']=='explicit-sRGB-assumption')
+        else:
+            self.profile=None;self.canvas.patch_names=[];self.profile_label.set('未载入参考配置')
+        self.mark_dirty()
         self.tabs.select(self.editor)
 
     def correct(self):
@@ -453,11 +588,20 @@ class App:
         reason=ttk.Entry(dialog,width=55);reason.pack(padx=15);reason.insert(0,'视觉核对后更正')
         def save():
             if combo.current()<0:raise ValueError('请选择正确的稳定 ID')
-            self.store.correct_identity(row['id'],choices[combo.current()]['id'],reason.get());dialog.destroy();self.refresh_history();self.refresh_coverage()
+            self.store.correct_identity(row['id'],choices[combo.current()]['id'],reason.get());dialog.destroy();self.refresh_moles()
         ttk.Button(dialog,text='确认纠正',command=lambda:self.safe(save)).pack(pady=15)
     def backup(self):
+        self.flush_draft()
+        capacity=self.store.backup_capacity()
         path=filedialog.asksaveasfilename(parent=self.root,title='备份含原件与敏感元数据，未加密；请选择非同步目录',defaultextension='.zip',initialfile='mole-backup-'+date.today().isoformat()+'.zip')
-        if path:self.store.backup(path);self.status.set('本地备份完成，包含所有原件、标记、参考与历史。未加密，未上传。')
+        if not path:return
+        data_root=self.store.root
+        def work():
+            store=Store(data_root)
+            try:store.backup(path)
+            finally:store.close()
+        self.run_job(f'备份 {capacity["photos"]} 份原件（{capacity["original_bytes"]/1024**3:.2f} GiB，上限 16 GiB）',work,
+                     lambda _:self.status.set('本地备份完成，包含全部原件、历史和恢复草稿。未加密，未上传。'))
     def restore(self):
         source=filedialog.askopenfilename(parent=self.root,title='选择本地备份',filetypes=[('ZIP','*.zip')])
         if not source:return
@@ -466,8 +610,9 @@ class App:
         name=simpledialog.askstring('恢复副本','新文件夹名称（不能已存在）',initialvalue='mole-restored',parent=self.root)
         if not name:return
         if name in ('.','..') or '/' in name or '\\' in name:raise ValueError('请输入单一文件夹名称')
-        restore_backup(source,Path(parent)/name)
-        messagebox.showinfo('恢复成功','副本已恢复。使用 python -m moletracker --data <恢复目录> 打开；当前资料未覆盖。',parent=self.root)
+        destination=Path(parent)/name
+        self.run_job('恢复备份',lambda:restore_backup(source,destination),
+                     lambda _:messagebox.showinfo('恢复成功','副本已恢复。使用 python -m moletracker --data <恢复目录> 打开；当前资料未覆盖。',parent=self.root))
     def guide(self):
         dialog=tk.Toplevel(self.root);dialog.title('拍摄协议与边界');dialog.geometry('850x650')
         widget=tk.Text(dialog,wrap='word',padx=18,pady=18);widget.pack(fill='both',expand=True)
@@ -477,7 +622,10 @@ class App:
         path=Path(__file__).parents[1]/'docs'/'CAPTURE_PROTOCOL.md'
         return path.read_text(encoding='utf-8') if path.exists() else '详细协议随源代码 docs/CAPTURE_PROTOCOL.md 提供。'
     def close(self):
-        if self.discard():self.store.close();self.root.destroy()
+        if self.busy:
+            self.status.set('任务仍在进行，请完成后再关闭窗口。');return
+        if self.discard():
+            self.executor.shutdown(wait=True);self.store.close();self.root.destroy()
 
 
 def main():

@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import sys
+import time
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,71 @@ from tests.test_integration import fixture
 
 @unittest.skipIf(sys.platform.startswith('linux') and not os.environ.get('DISPLAY'),'Native display unavailable')
 class GuiSmokeTests(unittest.TestCase):
+    def wait_job(self, app):
+        deadline=time.monotonic()+15
+        while app.busy and time.monotonic()<deadline:
+            app.root.update()
+            time.sleep(.01)
+        self.assertFalse(app.busy, '后台任务未完成')
+
+    def test_draft_flush_and_unfinished_polygon_survive_navigation_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=tk.Tk();store=Store(Path(tmp)/'data')
+            try:
+                app=App(root,store);root.update()
+                app.session=store.create_session('2026-10')
+                app.mole=store.add_mole(REGIONS[0],'合成位置')
+                path=Path(tmp)/'sample.png';fixture(path)
+                app.photo=store.import_photo(path,app.session,'detail')
+                app.canvas.load(path)
+                app.canvas.mode=1;app.canvas.points=[[1,1],[20,1]]
+                app.notes.insert('1.0','尚未完成');app.mark_dirty();app.flush_draft()
+                payload=store.load_draft(app.mole,app.session,app.photo)
+                self.assertEqual(payload['points'],[[1,1],[20,1]])
+                self.assertEqual(payload['notes'],'尚未完成')
+                with self.assertRaises(ValueError):app.canvas.set_mode(2)
+                self.assertEqual(app.canvas.points,payload['points'])
+                self.assertEqual(app.canvas.mode,1)
+                app.canvas.set_mode(1)
+                self.assertEqual(app.canvas.points,payload['points'])
+                app.canvas.points=[];app.canvas.masks['mole']=[[1,1],[20,1],[20,20]]
+                app.canvas.undo()
+                self.assertEqual(app.canvas.points,[[1,1],[20,1]])
+            finally:store.close();root.destroy()
+
+    def test_restoring_current_draft_keeps_latest_unsaved_notes(self):
+        from tkinter import ttk
+        with tempfile.TemporaryDirectory() as tmp:
+            root=tk.Tk();store=Store(Path(tmp)/'data')
+            try:
+                app=App(root,store);root.update()
+                app.session=store.create_session('2026-10');app.mole=store.add_mole(REGIONS[0],'合成位置')
+                path=Path(tmp)/'sample.png';fixture(path)
+                app.photo=store.import_photo(path,app.session,'detail');app.canvas.load(path)
+                app.notes.insert('1.0','旧草稿');app.mark_dirty();app.flush_draft()
+                app.notes.delete('1.0','end');app.notes.insert('1.0','最新编辑');app.mark_dirty()
+                app.restore_draft()
+                dialog=next(w for w in root.winfo_children() if isinstance(w,tk.Toplevel))
+                button=next(w for w in dialog.winfo_children() if isinstance(w,ttk.Button))
+                with patch('tkinter.messagebox.askyesno',return_value=True):button.invoke()
+                app.flush_draft()
+                self.assertEqual(store.load_draft(app.mole,app.session,app.photo)['notes'],'最新编辑')
+                self.assertFalse(any(v.get() for v in app.qc))
+            finally:store.close();root.destroy()
+
+    def test_background_work_keeps_event_loop_alive_and_locks_canvas(self):
+        from threading import Event
+        with tempfile.TemporaryDirectory() as tmp:
+            root=tk.Tk();store=Store(Path(tmp)/'data');release=Event()
+            try:
+                app=App(root,store);root.update();completed=[];heartbeats=[]
+                app.run_job('合成任务',lambda:release.wait(5),completed.append)
+                root.after(0,lambda:heartbeats.append(True));root.update()
+                self.assertEqual(heartbeats,[True]);self.assertTrue(app.canvas.locked)
+                release.set();self.wait_job(app)
+                self.assertEqual(completed,[True]);self.assertFalse(app.canvas.locked)
+            finally:release.set();store.close();root.destroy()
+
     def test_full_flow_and_unsaved_cancel(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=tk.Tk();store=Store(Path(tmp)/'data')
@@ -23,7 +89,7 @@ class GuiSmokeTests(unittest.TestCase):
                 app.session=session;app.mole=mole;app.photo=photo;app.refresh_sessions();app.refresh_moles()
                 app.canvas.load(store.photo_path(photo),masks);app.profile=profile;app.srgb.set(True)
                 for var in app.qc:var.set(True)
-                app.save_comparable();root.update()
+                app.save_comparable();self.wait_job(app);root.update()
                 self.assertEqual(len(store.observations(mole)),1)
                 app.canvas.zoom(1.25);app.canvas.fit();root.update()
                 app.dirty=True
@@ -161,12 +227,12 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertEqual(len(wizard.preview.get_children()),6)
                 output=Path(tmp)/'profile.json'
                 with patch('tkinter.filedialog.asksaveasfilename',return_value=str(output)):wizard.save()
-                self.assertEqual(json.loads(output.read_text())['patch_ids'],['P1','P2','P3','P4','P5','P6'])
+                self.assertEqual(json.loads(output.read_text(encoding='utf-8'))['patch_ids'],['P1','P2','P3','P4','P5','P6'])
                 app.session=store.create_session('2026-09');app.mole=store.add_mole(REGIONS[0],'synthetic');app.photo=store.import_photo(path,app.session,'detail')
                 app.refresh_sessions();app.refresh_moles();app.canvas.load(store.photo_path(app.photo),masks)
                 app.srgb.set(True)
                 for var in app.qc:var.set(True)
-                app.save_comparable();self.assertEqual(len(store.observations(app.mole)),1)
+                app.save_comparable();self.wait_job(app);self.assertEqual(len(store.observations(app.mole)),1)
                 app.tabs.select(app.cover);root.update()
                 self.assertEqual((root.winfo_width(),root.winfo_height()),(1100,760))
                 print('Layout: exact 1100x760 content window, 17-point large-font coverage scroll checked')

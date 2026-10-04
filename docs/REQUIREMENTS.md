@@ -12,6 +12,8 @@ A private, offline, manual monthly photo journal for approximately 20–30 ident
 - Per-image linear RGB-to-XYZ 3×3 least squares and D50 Lab; median mole L*, normal-skin L*, D = skin minus mole; eligible longitudinal deltas only with matching methods and reference provenance
 - Uncalibrated or unsuitable records remain useful as photos; no invented numbers or silent imputation. Retake guidance prominent
 - Local explicit backup and validated restore, no upload; no encryption claim
+- Recovery drafts remain separate from observations and require renewed human QC; latest monthly status guides missing/retake navigation
+- User-started import, analysis, backup and restore run in a background worker while editor state is locked; this does not schedule automatic backups
 - Cross-platform Python launch instructions; OS tests clearly separated from assumptions
 
 ## Deliberate first-version limits

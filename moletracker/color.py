@@ -50,7 +50,8 @@ def analysis_image(path, assume_srgb=False):
             elif not assume_srgb:
                 raise ValueError('无可信色彩配置；请确认来源为 sRGB，或仅保存未校准照片')
             result = original.convert('RGB')
-        return np.asarray(result, dtype=float) / 255., provenance
+        # Retain the decoded raster as bytes; normalize only selected samples.
+        return np.asarray(result), provenance
 
 
 def reference_xyz(profile):
@@ -132,10 +133,15 @@ def patch_medians(image, rectangles):
         x1,y1,x2,y2=map(int,rect)
         if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h) or (x2-x1)*(y2-y1) < MIN_PIXELS:
             raise ValueError('每个参考块至少 100 像素，且需位于原图内')
-        pixels=image[y1:y2,x1:x2].reshape(-1,3)
+        pixels=_samples(image[y1:y2,x1:x2].reshape(-1,3))
         _pixel_qc(pixels)
         values.append(np.median(pixels,axis=0))
     return values
+
+
+def _samples(pixels):
+    values = np.asarray(pixels, dtype=float)
+    return values / 255. if pixels.dtype == np.uint8 else values
 
 
 def _pixel_qc(pixels):
@@ -158,17 +164,18 @@ def _lstar(pixels, matrix):
 
 
 def measure(image, mole_mask, skin_mask, fit, ordinary_skin=True):
-    image=np.asarray(image,dtype=float)
+    image=np.asarray(image)
     if image.ndim != 3 or image.shape[2] != 3 or mole_mask.shape != image.shape[:2]:
         raise ValueError('图像和掩膜尺寸不一致')
-    pixels=image[mole_mask]
+    pixels=_samples(image[mole_mask])
     _pixel_qc(pixels)
     mole_l=_lstar(pixels,fit['matrix'])
     skin_l=None
     if ordinary_skin:
         if skin_mask is None or skin_mask.shape != mole_mask.shape or np.any(mole_mask & skin_mask):
             raise ValueError('请选择与痣不重叠的邻近正常皮肤')
-        _pixel_qc(image[skin_mask]);skin_l=_lstar(image[skin_mask],fit['matrix'])
+        skin_pixels=_samples(image[skin_mask])
+        _pixel_qc(skin_pixels);skin_l=_lstar(skin_pixels,fit['matrix'])
     return {'mole_l':mole_l,'skin_l':skin_l,'d':None if skin_l is None else skin_l-mole_l,
             'method':METHOD,'profile_hash':fit['profile_hash'], 'fit':fit,
             'mole_pixels':int(mole_mask.sum()),'skin_pixels':int(skin_mask.sum()) if ordinary_skin else 0,

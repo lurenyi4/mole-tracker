@@ -6,6 +6,11 @@
 3. Safe imports: malformed/oversized files, originals byte-identical, paths not accepted from backups, hash validation, no overwrite restore
 4. End-to-end synthetic workflow: session → import → ID → masks → measurement → second month → eligible deltas → correction → backup → restored reopen
 5. Native GUI launch and smoke: import/select/mark/save/review and cancellation/repeated actions where display available
+6. Draft reopen and backup roundtrip without creating an observation; restoring the current draft preserves newer edits and resets human QC
+7. Byte-raster and normalized-float measurements match; background jobs leave the Tk event loop responsive and lock editing; full-suite window lifecycle checks
+8. Monthly status uses the latest observation; unfinished points survive repeated tool selection; bounded 16 GiB backup accounting is tested without claiming a physical 16 GiB archive trial
+
+2026-10-05 Windows verification: 46 tests passed, zero skipped. A fresh independent reviewer repeated the full suite and completed focused plus full Spec / Standards review. Test artifacts were recycled through the local Windows helper; no private journal was used. Real disk-full behavior, a physical 16 GiB archive, long-running task stability and 12/24/30 MP peak-memory measurements remain unverified.
 
 ## Human gates not replaced by synthetic tests
 - Windows and macOS launch/package and file-dialog checks
