@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moletracker-local"
+version = "0.1.0"
+description = "Offline manual photo journal with experimental calibrated color measurements"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=11.3,<13", "numpy>=2,<3"]
+
+[project.scripts]
+moletracker = "moletracker.app:main"
+
+[tool.setuptools.packages.find]
+include = ["moletracker*"]

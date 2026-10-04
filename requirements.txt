@@ -1,0 +1,3 @@
+# Versions used for the cloud Python 3.12 numerical test run.
+Pillow==12.3.0
+numpy==2.3.5

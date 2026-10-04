@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.local-data/
+
+# Local journals, generated demos and backups of SQLite state
+MoleJournal/
+MoleDemo/
+.moletracker/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Test output and tool caches
+docs/test-evidence/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.log
+
+# Local secrets and operating-system metadata
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
