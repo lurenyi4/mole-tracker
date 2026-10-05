@@ -1,6 +1,6 @@
 """Local journal and integrity-checked portable backups. No network functions."""
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import hashlib
 import io
 import json
@@ -13,7 +13,7 @@ import uuid
 import warnings
 import zipfile
 from PIL import Image
-from .validation import validate_observation
+from .validation import validate_observation, validate_draft_geometry
 
 REGIONS = ('头面耳颈 / scalp 头皮','前躯干与两侧','背部','手臂与腋下','双手、指缝和指甲',
            '腿部与可见褶皱','双脚、趾缝、足底和趾甲','可选外部皮肤黏膜交界')
@@ -59,7 +59,7 @@ class Store:
         (self.root/'originals').mkdir(exist_ok=True)
         self.db=sqlite3.connect(self.root/'journal.sqlite3')
         self.db.row_factory=sqlite3.Row
-        if self.db.execute('PRAGMA user_version').fetchone()[0] > 1:
+        if self.db.execute('PRAGMA user_version').fetchone()[0] > 2:
             self.db.close()
             raise ValueError('资料由更新版本创建，请使用新版应用打开')
         self.db.execute('PRAGMA foreign_keys=ON')
@@ -71,18 +71,20 @@ class Store:
         CREATE TABLE IF NOT EXISTS coverage(session_id TEXT NOT NULL REFERENCES sessions(id), region TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(session_id,region));
         CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY, observation_id TEXT REFERENCES observations(id), detail TEXT NOT NULL, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS drafts(mole_id TEXT NOT NULL REFERENCES moles(id), session_id TEXT NOT NULL REFERENCES sessions(id), photo_id TEXT NOT NULL REFERENCES photos(id), payload TEXT NOT NULL, updated TEXT NOT NULL, PRIMARY KEY(mole_id,session_id,photo_id));
+        CREATE TABLE IF NOT EXISTS tracking(mole_id TEXT PRIMARY KEY REFERENCES moles(id),start_month TEXT NOT NULL,end_month TEXT NOT NULL DEFAULT '',overview_photo TEXT REFERENCES photos(id));
+        CREATE TABLE IF NOT EXISTS photo_names(photo_id TEXT PRIMARY KEY REFERENCES photos(id),filename TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS photos_session_hash_role ON photos(session_id,hash,role);
         CREATE INDEX IF NOT EXISTS observations_mole_session ON observations(mole_id,session_id,created);
         CREATE INDEX IF NOT EXISTS observations_session ON observations(session_id);
-        PRAGMA user_version=1;
+        PRAGMA user_version=2;
         ''')
         self.db.commit()
 
     def close(self): self.db.close()
     def rows(self,query,args=()): return [dict(r) for r in self.db.execute(query,args)]
     def sessions(self): return self.rows('SELECT * FROM sessions ORDER BY month DESC')
-    def moles(self): return self.rows('SELECT * FROM moles ORDER BY created,id')
-    def photos(self,session): return self.rows('SELECT * FROM photos WHERE session_id=? ORDER BY created',(session,))
+    def moles(self): return self.rows("SELECT m.*,COALESCE(t.start_month,'') AS start_month,COALESCE(t.end_month,'') AS end_month,t.overview_photo FROM moles m LEFT JOIN tracking t ON t.mole_id=m.id ORDER BY m.created,m.id")
+    def photos(self,session): return self.rows("SELECT p.*,COALESCE(n.filename,'旧版原件 · '||substr(p.hash,1,8)) AS filename FROM photos p LEFT JOIN photo_names n ON n.photo_id=p.id WHERE p.session_id=? ORDER BY p.created",(session,))
     def audit(self): return self.rows('SELECT * FROM audit ORDER BY created')
     def _exists(self,table,key):
         if table not in TABLES or not self.db.execute(f'SELECT 1 FROM {table} WHERE id=?',(key,)).fetchone():
@@ -97,11 +99,49 @@ class Store:
         with self.db:self.db.execute('INSERT INTO sessions VALUES (?,?,?)',(key,month,now()))
         return key
 
-    def add_mole(self,region,location):
+    def add_mole(self,region,location,start_month=None):
         if region not in REGIONS: raise ValueError('身体区域无效')
         key=identifier()
-        with self.db:self.db.execute('INSERT INTO moles VALUES (?,?,?,?)',(key,region,text(location,500),now()))
+        if start_month is None:
+            sessions=self.sessions()
+            start_month=sessions[0]['month'] if sessions else date.today().strftime('%Y-%m')
+        self.validate_month(start_month)
+        with self.db:
+            self.db.execute('INSERT INTO moles VALUES (?,?,?,?)',(key,region,text(location,500),now()))
+            self.db.execute('INSERT INTO tracking VALUES (?,?,?,?)',(key,start_month,'',None))
         return key
+
+    @staticmethod
+    def validate_month(month):
+        if not isinstance(month,str) or not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',month):
+            raise ValueError('追踪月份格式应为 YYYY-MM')
+
+    def validate_tracking(self,mole,start_month,end_month='',overview_photo=None):
+        if not isinstance(mole,str) or not isinstance(start_month,str) or not isinstance(end_month,str):
+            raise ValueError('追踪身份和月份必须是字符串')
+        if overview_photo is not None and (not isinstance(overview_photo,str) or not overview_photo):
+            raise ValueError('定位照片身份无效')
+        self._exists('moles',mole)
+        if start_month:self.validate_month(start_month)
+        if end_month:
+            self.validate_month(end_month)
+            if start_month and end_month<start_month:raise ValueError('归档月份不能早于纳入月份')
+        if overview_photo:
+            self._exists('photos',overview_photo)
+            if self.rows('SELECT role FROM photos WHERE id=?',(overview_photo,))[0]['role']!='overview':
+                raise ValueError('定位照片必须是概览照片')
+        return mole,start_month,end_month,overview_photo
+
+    def set_tracking(self,mole,start_month,end_month='',overview_photo=None):
+        values=self.validate_tracking(mole,start_month,end_month,overview_photo)
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO tracking VALUES (?,?,?,?)',values)
+            self.db.execute('INSERT INTO audit VALUES (?,?,?,?)',(identifier(),None,json.dumps({'mole_id':mole,'tracking':{'start':start_month,'end':end_month,'overview':overview_photo}},ensure_ascii=False),now()))
+
+    def active_moles(self,session):
+        self._exists('sessions',session)
+        month=self.rows('SELECT month FROM sessions WHERE id=?',(session,))[0]['month']
+        return [m for m in self.moles() if (not m['start_month'] or m['start_month']<=month) and (not m['end_month'] or month<m['end_month'])]
 
     def edit_mole(self,key,region,location):
         self._exists('moles',key)
@@ -130,7 +170,9 @@ class Store:
                 tmp=Path(file.name);file.write(raw)
             tmp.replace(dest)
         key=identifier()
-        with self.db:self.db.execute('INSERT INTO photos VALUES (?,?,?,?,?,?,?)',(key,session,digest,w,h,role,now()))
+        with self.db:
+            self.db.execute('INSERT INTO photos VALUES (?,?,?,?,?,?,?)',(key,session,digest,w,h,role,now()))
+            self.db.execute('INSERT INTO photo_names VALUES (?,?)',(key,path.name))
         return key
 
     def photo_path(self,key):
@@ -185,7 +227,8 @@ class Store:
         with self.db:self.db.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)',(session,region,state))
 
     def missing(self,session):
-        return [r['id'] for r in self.rows('SELECT id FROM moles WHERE id NOT IN (SELECT mole_id FROM observations WHERE session_id=?) ORDER BY created,id',(session,))]
+        present=set(self.monthly_status(session))
+        return [m['id'] for m in self.active_moles(session) if m['id'] not in present]
 
     def monthly_status(self, session):
         return {r['mole_id']: r['status'] for r in self.rows(
@@ -210,8 +253,8 @@ class Store:
                 any(type(v) not in (int,float) for v in p) or
                 not (0<=p[0]<photo_row['width'] and 0<=p[1]<photo_row['height']) for p in points)):
             raise ValueError('草稿未完成标记无效')
-        # Drafts can be unfinished, but completed shapes still use the shared domain gate.
-        validate_observation('uncalibrated',payload['masks'],None,photo_row,session)
+        # A draft is not a measurement. Validate coordinates without allocating full-size masks.
+        validate_draft_geometry(payload['masks'],(photo_row['width'],photo_row['height']))
         if payload.get('profile') is not None:
             from .color import reference_xyz
             reference_xyz(payload['profile'])
@@ -234,17 +277,18 @@ class Store:
         total = sum((self.root/'originals'/p['hash']).stat().st_size for p in photos)
         return {'photos': len(photos), 'original_bytes': total, 'limit_bytes': MAX_BACKUP}
 
-    def backup(self,path):
+    def backup(self,path,progress=None):
         path=Path(path)
         if path.exists():raise ValueError('备份文件已存在；请选择新文件名')
         # Explicit read transaction gives all tables the same SQLite snapshot.
         self.db.execute('BEGIN')
         try:
-            data={'format':1,'tables':{t:self.rows(f'SELECT * FROM {t}') for t in TABLES},
-                  'drafts': self.rows('SELECT * FROM drafts')}
+            data={'format':2,'tables':{t:self.rows(f'SELECT * FROM {t}') for t in TABLES},
+                  'drafts': self.rows('SELECT * FROM drafts'),
+                  'tracking':self.rows('SELECT * FROM tracking'),'photo_names':self.rows('SELECT * FROM photo_names')}
         finally:
             self.db.rollback()
-        if any(len(rows)>MAX_RECORDS for rows in data['tables'].values()):
+        if any(len(rows)>MAX_RECORDS for rows in [*data['tables'].values(),data['drafts'],data['tracking'],data['photo_names']]):
             raise ValueError('备份记录数超过本版本恢复限制；未发布备份')
         photos = {p['id']: p for p in data['tables']['photos']}
         for observation in data['tables']['observations']:
@@ -262,13 +306,16 @@ class Store:
         try:
             with zipfile.ZipFile(temp,'w',compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr('manifest.json',manifest)
-                for digest in sorted(hashes):
+                for index,digest in enumerate(sorted(hashes)):
+                    if progress:progress('备份原件',index,len(hashes))
                     checksum=hashlib.sha256()
                     with (self.root/'originals'/digest).open('rb') as source, archive.open('originals/'+digest,'w',force_zip64=True) as output:
                         while chunk := source.read(1024*1024):
+                            if progress:progress('备份原件',index,len(hashes))
                             checksum.update(chunk)
                             output.write(chunk)
                     if checksum.hexdigest()!=digest:raise ValueError('原件校验失败，备份已中止')
+            if progress:progress('发布备份',len(hashes),len(hashes))
             temp.replace(path)
         finally:
             if temp.exists():temp.unlink()
@@ -279,7 +326,7 @@ def check_backup_limits(members, total_bytes, manifest_bytes):
         raise ValueError('备份超出本版本可恢复限制（解压后 16 GiB、10000 文件、清单 10 MiB）。未发布备份；请保留资料目录的离线副本，勿删除原件')
 
 
-def restore_backup(source,destination):
+def restore_backup(source,destination,progress=None):
     """Restore into a new directory only; reject unknown members and traversal."""
     destination=Path(destination).resolve()
     if destination.exists():raise ValueError('恢复目标必须是一个尚不存在的新文件夹')
@@ -290,7 +337,12 @@ def restore_backup(source,destination):
         check_backup_limits(len(names),sum(e.file_size for e in entries),archive.getinfo('manifest.json').file_size)
         try:data=json.loads(archive.read('manifest.json'))
         except Exception as exc:raise ValueError('备份清单损坏') from exc
-        if not isinstance(data,dict) or data.get('format')!=1 or set(data.get('tables',{}))!=set(TABLES):raise ValueError('备份格式不支持')
+        if (not isinstance(data,dict) or type(data.get('format')) is not int or data['format'] not in (1,2)
+                or not isinstance(data.get('tables'),dict) or set(data['tables'])!=set(TABLES)):
+            raise ValueError('备份格式不支持')
+        if data['format']==2:
+            if set(data)!={'format','tables','drafts','tracking','photo_names'} or any(not isinstance(data[key],list) for key in ('drafts','tracking','photo_names')):
+                raise ValueError('新版备份必须包含完整的草稿、追踪范围和照片名称清单')
         tables=data['tables']
         if any(not isinstance(tables[t],list) or len(tables[t])>MAX_RECORDS for t in TABLES):raise ValueError('备份记录无效')
         try:hashes={p['hash'] for p in tables['photos']}
@@ -304,7 +356,8 @@ def restore_backup(source,destination):
         restored=None
         try:
             restored=Store(staging)
-            for h in hashes:
+            for index,h in enumerate(hashes):
+                if progress:progress('校验恢复原件',index,len(hashes))
                 if archive.getinfo('originals/'+h).file_size>MAX_FILE:raise ValueError('备份照片超过限制')
                 raw=archive.read('originals/'+h)
                 if hashlib.sha256(raw).hexdigest()!=h:raise ValueError('备份原件校验失败')
@@ -330,11 +383,29 @@ def restore_backup(source,destination):
             for p in restored.rows('SELECT * FROM photos'):
                 w,h,_=validate_image(restored.photo_path(p['id']).read_bytes())
                 if (w,h)!=(p['width'],p['height']) or p['role'] not in ('detail','overview'):raise ValueError('备份照片元数据无效')
+            for key in ('tracking','photo_names'):
+                entries=data.get(key,[])
+                if not isinstance(entries,list) or len(entries)>MAX_RECORDS:raise ValueError('备份附加资料无效')
+                seen=set()
+                for item in entries:
+                    expected={'mole_id','start_month','end_month','overview_photo'} if key=='tracking' else {'photo_id','filename'}
+                    if not isinstance(item,dict) or set(item)!=expected:raise ValueError('备份附加字段不匹配')
+                    identity=item['mole_id' if key=='tracking' else 'photo_id']
+                    if not isinstance(identity,str) or identity in seen:raise ValueError('备份附加身份无效或重复')
+                    seen.add(identity)
+                    if key=='tracking':
+                        values=restored.validate_tracking(item['mole_id'],item['start_month'],item['end_month'],item['overview_photo'])
+                        with restored.db:restored.db.execute('INSERT INTO tracking VALUES (?,?,?,?)',values)
+                    else:
+                        restored._exists('photos',item['photo_id'])
+                        name=text(item['filename'],1000)
+                        with restored.db:restored.db.execute('INSERT INTO photo_names VALUES (?,?)',(item['photo_id'],name))
             drafts = data.get('drafts', [])
             if not isinstance(drafts, list) or len(drafts) > MAX_RECORDS:
                 raise ValueError('备份草稿无效')
             for draft in drafts:
                 restored.save_draft(draft['mole_id'], draft['session_id'], draft['photo_id'], json.loads(draft['payload']))
+            if progress:progress('发布恢复副本',len(hashes),len(hashes))
             restored.close();restored=None
             staging.rename(destination)
         except (sqlite3.Error,KeyError,TypeError,json.JSONDecodeError) as exc:

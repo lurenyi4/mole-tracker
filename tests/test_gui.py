@@ -123,7 +123,9 @@ class GuiSmokeTests(unittest.TestCase):
                 store.photo_path(bad).write_bytes(b'corrupt')
                 index=next(i for i,r in enumerate(app.photo_rows) if r['id']==bad)
                 app.photo_list.selection_clear(0,'end');app.photo_list.selection_set(index)
-                with self.assertRaises(ValueError):app.select_photo()
+                with patch('tkinter.messagebox.showerror') as error:
+                    app.select_photo();self.wait_job(app)
+                    error.assert_called_once()
                 self.assertEqual(app.photo,good);self.assertIs(app.canvas.original,oldimage);self.assertIs(app.canvas.masks,oldmasks)
                 self.assertEqual(app.selected(app.photo_list,app.photo_rows)['id'],good)
                 self.assertTrue(all(var.get() for var in app.qc))
@@ -134,7 +136,7 @@ class GuiSmokeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):store.save_observation(mole,session,bad,masks,None,'retake','failed load')
                 # Repair test fixture directly, then retry normally.
                 (store.root/'originals'/next(p['hash'] for p in app.photo_rows if p['id']==bad)).write_bytes(badpath.read_bytes())
-                app.photo_list.selection_clear(0,'end');app.photo_list.selection_set(index);app.select_photo()
+                app.photo_list.selection_clear(0,'end');app.photo_list.selection_set(index);app.select_photo();self.wait_job(app)
                 self.assertEqual(app.photo,bad);self.assertEqual(app.canvas.masks.get('mole'),[])
                 self.assertFalse(app.srgb.get());self.assertTrue(app.ordinary.get());self.assertFalse(any(v.get() for v in app.qc))
             finally:store.close();root.destroy()

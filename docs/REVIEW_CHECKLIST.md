@@ -25,3 +25,8 @@ Review the entire project, not only latest diff. Run `python -m unittest -v` and
 - [ ] Run the entire native suite in one process to check Tk/worker cleanup, not only separate modules
 - [ ] Check latest monthly status after month changes, history loads and identity correction; retain all historical versions
 - [ ] Verify uint8 and float sample equivalence, backup snapshot/streaming limits and separate documented physical capacity tests
+- [ ] Check tracking range/overview/filename roundtrip preserves exact audit history; format 2 rejects missing sections, wrong types, unknown fields and duplicate metadata identities
+- [ ] Confirm display rotation, vertex/rectangle editing and undo/redo preserve original coordinates; old async render results cannot replace newer photos
+- [ ] Check lightweight drafts allocate no full-resolution masks, while formal observations retain the complete validation gate
+- [ ] Check cooperative cancel/close, unpublished archive behavior, per-directory interactive lock, thumbnail pagination and linked visual comparison
+- [ ] Record smaller-window/scaling and synthetic image-memory measurements separately from real-camera and real Windows DPI claims

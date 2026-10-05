@@ -14,6 +14,7 @@ Never copy universal invented patch values. If values are given in another illum
 
 ## Pipeline and provenance
 1. Originals are stored byte-for-byte, with their EXIF/ICC. Analysis uses an independent copy of the original unrotated raster. Masks/patch rectangles persist in original coordinates, not scaled canvas coordinates
+   Manual display rotation and vertex edits map back to that raster. Linked comparison percentages describe pixel display ratios, not lesion physical size. Display previews and lightweight recovery-draft checks never replace full measurement validation.
 2. Embedded ICC is converted using Pillow/LittleCMS into encoded sRGB. An EXIF sRGB declaration can be used; untagged images require an explicit user sRGB assumption. Unknown/broken profiles and non-RGB/transparent analysis are rejected. Display images are previews, not calibrated monitors
 3. Per-patch median encoded RGB is decoded using the piecewise sRGB transfer function into linear RGB. Fit a zero-offset 3×3 least-squares matrix from these samples to supplied D50 XYZ
 

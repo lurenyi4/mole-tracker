@@ -1,7 +1,12 @@
 """Native, offline Tk application. All image coordinates refer to stored raster."""
 import argparse
 import gc
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, CancelledError
+from threading import Event
+from queue import SimpleQueue, Empty
+import subprocess
+import sys
+import os
 from datetime import date
 import json
 from pathlib import Path
@@ -18,113 +23,20 @@ STATUS_NAMES={'comparable':'可比较（实验）','uncalibrated':'未校准','r
 MODE_NAMES=('浏览 / 拖动','痣内部多边形','邻近正常皮肤','排除毛发 / 反光','色卡块矩形（按配置顺序）')
 
 
-class PhotoCanvas(ttk.Frame):
-    def __init__(self,parent,changed):
-        super().__init__(parent);self.changed=changed
-        self.canvas=tk.Canvas(self,bg='#202832',highlightthickness=0,width=500,height=120)
-        sy=ttk.Scrollbar(self,orient='vertical',command=self.canvas.yview)
-        sx=ttk.Scrollbar(self,orient='horizontal',command=self.canvas.xview)
-        self.canvas.configure(xscrollcommand=sx.set,yscrollcommand=sy.set)
-        self.canvas.grid(row=0,column=0,sticky='nsew');sy.grid(row=0,column=1,sticky='ns');sx.grid(row=1,column=0,sticky='ew')
-        self.rowconfigure(0,weight=1);self.columnconfigure(0,weight=1)
-        self.original=None;self.patch_names=[];self.scale=1.;self.mode=0;self.points=[];self.masks={};self.start=None
-        self.locked=False
-        self.canvas.bind('<Button-1>',self.click)
-        self.canvas.bind('<B1-Motion>',self.drag)
-        self.canvas.bind('<ButtonRelease-1>',self.release)
-        self.canvas.bind('<Button-3>',lambda e:self.finish())
-
-    def load(self,path,masks=None):
-        # Decode first; failure must not pair an old raster/mask with a new ID.
-        with Image.open(path) as image:
-            prepared=image.convert('RGB')
-        previous=(self.original,self.masks,self.points,self.scale)
-        self.original=prepared
-        self.masks=masks or {'mole':[],'skin':[],'exclude':[],'patches':[]}
-        self.points=[]
-        try:
-            self.fit()
-        except Exception:
-            self.original,self.masks,self.points,self.scale=previous
-            self.render()
-            raise
-
-    def fit(self):
-        if self.original:
-            width=self.canvas.winfo_width();height=self.canvas.winfo_height()
-            self.scale=min((width if width>1 else 400)/self.original.width,
-                           (height if height>1 else 300)/self.original.height,1.)
-            self.render()
-    def zoom(self,factor):
-        if self.original:
-            # Limit display allocation, independent of full-resolution measurement.
-            self.scale=max(.03,min(self.scale*factor,4.,6000/max(self.original.size)))
-            self.render()
-    def render(self):
-        if self.original is None:return
-        w,h=self.original.size;size=(max(1,int(w*self.scale)),max(1,int(h*self.scale)))
-        self.tkimage=ImageTk.PhotoImage(self.original.resize(size,Image.Resampling.LANCZOS))
-        self.canvas.delete('all');self.canvas.create_image(0,0,image=self.tkimage,anchor='nw')
-        self.canvas.configure(scrollregion=(0,0,*size));self.outlines()
-    def outlines(self):
-        self.canvas.delete('mark')
-        for key,color in [('mole','#ffcb57'),('skin','#59dfbf')]:
-            points=self.masks.get(key,[])
-            if len(points)>=3:self.canvas.create_polygon(*[v*self.scale for p in points for v in p],outline=color,fill='',width=2,tags='mark')
-        for poly in self.masks.get('exclude',[]):
-            self.canvas.create_polygon(*[v*self.scale for p in poly for v in p],outline='#ff6c8b',fill='',width=2,tags='mark')
-        for i,r in enumerate(self.masks.get('patches',[])):
-            self.canvas.create_rectangle(*[v*self.scale for v in r],outline='#74b6ff',width=2,tags='mark')
-            self.canvas.create_text(r[0]*self.scale+5,r[1]*self.scale+5,text=str(i+1)+((': '+self.patch_names[i]) if i<len(self.patch_names) else ''),fill='#74b6ff',anchor='nw',tags='mark')
-        if self.points:
-            points=[v*self.scale for p in self.points for v in p]
-            if len(points)>=4:self.canvas.create_line(*points,fill='white',width=2,tags='mark')
-            for x,y in self.points:self.canvas.create_oval(x*self.scale-3,y*self.scale-3,x*self.scale+3,y*self.scale+3,fill='white',tags='mark')
-    def coords(self,event):
-        w,h=self.original.size
-        return [max(0,min(w-1,self.canvas.canvasx(event.x)/self.scale)),max(0,min(h-1,self.canvas.canvasy(event.y)/self.scale))]
-    def click(self,event):
-        if self.original is None or self.locked:return
-        if self.mode==0:self.canvas.scan_mark(event.x,event.y)
-        elif self.mode==4:self.start=self.coords(event)
-        else:self.points.append(self.coords(event));self.outlines();self.changed()
-    def drag(self,event):
-        if self.locked:return
-        if self.mode==0:self.canvas.scan_dragto(event.x,event.y,gain=1)
-    def release(self,event):
-        if self.locked:return
-        if self.original is not None and self.mode==4 and self.start:
-            end=self.coords(event);x,y=self.start
-            self.masks.setdefault('patches',[]).append([min(x,end[0]),min(y,end[1]),max(x,end[0]),max(y,end[1])])
-            self.start=None;self.outlines();self.changed()
-    def finish(self):
-        if self.locked:return
-        if self.mode not in (1,2,3) or len(self.points)<3:return
-        if self.mode==3:self.masks.setdefault('exclude',[]).append(self.points[:])
-        else:self.masks['mole' if self.mode==1 else 'skin']=self.points[:]
-        self.points=[];self.outlines();self.changed()
-    def undo(self):
-        if self.points:self.points.pop()
-        elif self.mode==4 and self.masks.get('patches'):self.masks['patches'].pop()
-        elif self.mode==3 and self.masks.get('exclude'):self.masks['exclude'].pop()
-        elif self.mode in (1,2):
-            key='mole' if self.mode==1 else 'skin'
-            self.points=self.masks.get(key,[])[:-1]
-            self.masks[key]=[]
-        self.outlines();self.changed()
-    def set_mode(self,mode):
-        if mode == self.mode:return
-        if self.points and mode != self.mode:
-            raise ValueError('请先完成多边形或撤销未完成的点，再切换标记工具')
-        self.points=[];self.mode=mode;self.outlines()
+from .photo_canvas import PhotoCanvas, prepare_photo
+from .instance import InstanceLock
+from . import workflow_ui
+from .comparison_ui import interactive_compare
 
 
 class App:
     def __init__(self,root,store):
         self.root=root;self.store=store;self.session=None;self.photo=None;self.mole=None;self.dirty=False;self.profile=None
         self.busy=False;self.draft_timer=None;self.job_timer=None
+        self.cancel_event=Event();self.progress_queue=SimpleQueue();self.close_after_job=False
+        self.thumbnail_images={};self.photo_picker=None
         self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='mole-work')
-        root.title('痣迹 · 本地照片记录');root.geometry('1400x900');root.minsize(1100,760)
+        root.title('痣迹 · 本地照片记录');root.geometry(f'{min(1400,root.winfo_screenwidth()-60)}x{min(900,root.winfo_screenheight()-100)}');root.minsize(800,560)
         family=next((f for f in ('Noto Sans CJK SC','Microsoft YaHei','PingFang SC') if f in tkfont.families(root)), 'sans-serif')
         for name in ('TkDefaultFont','TkTextFont','TkMenuFont','TkHeadingFont','TkCaptionFont'):
             tkfont.nametofont(name).configure(family=family,size=11)
@@ -139,9 +51,22 @@ class App:
         self.status=tk.StringVar(value='照片只在本机保存。原件含 EXIF / 位置等元数据；备份未加密，请存放在非同步安全目录。')
         self.status_label=ttk.Label(root,textvariable=self.status,padding=8,wraplength=1000)
         self.status_label.pack(side='bottom',fill='x')
+        self.cancel_button=ttk.Button(root,text='停止当前任务（保留已完成部分）',command=self.cancel_job,state='disabled')
+        self.cancel_button.pack(side='bottom',anchor='e',padx=8)
         self.tabs=ttk.Notebook(root);self.tabs.pack(fill='both',expand=True,padx=12,pady=10)
         self.editor=ttk.Frame(self.tabs,padding=10);self.review=ttk.Frame(self.tabs,padding=10);self.cover=ttk.Frame(self.tabs,padding=10)
         self.tabs.add(self.editor,text='  1  导入与标记  ');self.tabs.add(self.review,text='  2  历史与对比  ');self.tabs.add(self.cover,text='  3  覆盖清单  ')
+        self.editor_scroll=tk.Canvas(self.editor,highlightthickness=0)
+        editor_y=ttk.Scrollbar(self.editor,orient='vertical',command=self.editor_scroll.yview)
+        editor_x=ttk.Scrollbar(self.editor,orient='horizontal',command=self.editor_scroll.xview)
+        editor_y.pack(side='right',fill='y');editor_x.pack(side='bottom',fill='x');self.editor_scroll.pack(fill='both',expand=True)
+        self.editor_scroll.configure(yscrollcommand=editor_y.set,xscrollcommand=editor_x.set)
+        self.editor_body=ttk.Frame(self.editor_scroll)
+        editor_window=self.editor_scroll.create_window(0,0,window=self.editor_body,anchor='nw')
+        def resize_editor(event=None):
+            self.editor_scroll.itemconfigure(editor_window,width=max(self.editor_scroll.winfo_width(),self.editor_body.winfo_reqwidth()),height=max(self.editor_scroll.winfo_height(),self.editor_body.winfo_reqheight()))
+            self.editor_scroll.configure(scrollregion=self.editor_scroll.bbox('all'))
+        self.editor_body.bind('<Configure>',resize_editor);self.editor_scroll.bind('<Configure>',resize_editor)
         self.build_editor();self.build_review();self.build_coverage()
         root.protocol('WM_DELETE_WINDOW',self.close)
         root.bind('<Destroy>', self.cleanup, add='+')
@@ -153,6 +78,7 @@ class App:
         try:return fn()
         except Exception as exc:messagebox.showerror('未完成',str(exc),parent=self.root)
     def mark_dirty(self):
+        if hasattr(self,'mode'):self.mode.current(self.canvas.mode)
         self.dirty=True
         if self.draft_timer:return
         self.draft_timer=self.root.after(400,self.autosave_draft)
@@ -208,12 +134,20 @@ class App:
             self.status.set('编辑草稿已恢复，请重新检查全部人工质控后保存。');dialog.destroy()
         ttk.Button(dialog,text='恢复所选草稿',command=lambda:self.safe(restore)).pack(pady=10)
 
+    def progress(self,stage,current=0,total=0):
+        if self.cancel_event.is_set():raise CancelledError()
+        self.progress_queue.put(f'{stage} {current}/{total}' if total else stage)
+
+    def cancel_job(self):
+        self.cancel_event.set();self.status.set('已请求停止，将在安全边界结束；已保存原件与草稿保留。')
+
     def run_job(self,label,work,complete):
         if self.busy:raise ValueError('请等待当前任务完成')
         # Tk keeps callback cycles after destroyed windows. Collect them on their
         # owning thread before a worker's allocations can trigger cyclic GC.
         gc.collect()
-        self.flush_draft();self.busy=True;self.canvas.locked=True
+        self.flush_draft();self.busy=True;self.canvas.locked=True;self.cancel_event.clear()
+        self.progress_queue=SimpleQueue()
         disabled=[]
         def lock(widget):
             for child in widget.winfo_children():
@@ -223,17 +157,26 @@ class App:
                     except tk.TclError:pass
                 lock(child)
         lock(self.root);self.status.set(label+'，请稍候…')
+        self.cancel_button.configure(state='normal')
         future=self.executor.submit(work)
         def poll():
             self.job_timer=None
+            while not self.progress_queue.empty():
+                self.status.set(self.progress_queue.get())
             if not future.done():self.job_timer=self.root.after(50,poll);return
             self.busy=False;self.canvas.locked=False
             for widget,previous in disabled:
                 if widget.winfo_exists():widget.configure(state=previous)
+            self.cancel_button.configure(state='disabled')
             try:complete(future.result())
+            except CancelledError:
+                self.refresh_photos();self.status.set(label+'已停止；已完成部分与恢复草稿保留。')
             except Exception as exc:
+                self.refresh_photos()
                 self.status.set(label+'未完成；原记录和编辑草稿保留。')
                 messagebox.showerror('未完成',str(exc),parent=self.root)
+            if self.close_after_job:
+                self.close_after_job=False;self.close()
         self.job_timer=self.root.after(50,poll)
 
     def discard(self):
@@ -244,32 +187,39 @@ class App:
         indices=widget.curselection();return rows[indices[0]] if indices else None
 
     def build_editor(self):
-        side=ttk.Frame(self.editor,width=240);side.pack(side='left',fill='y',padx=(0,12))
+        side=ttk.Frame(self.editor_body,width=240);side.pack(side='left',fill='y',padx=(0,12));self.editor_side=side
         ttk.Label(side,text='月份').pack(anchor='w')
         self.month_combo=ttk.Combobox(side,state='readonly',width=27);self.month_combo.pack(fill='x')
         self.month_combo.bind('<<ComboboxSelected>>',lambda e:self.safe(self.select_session))
         ttk.Button(side,text='＋ 新建月份',command=lambda:self.safe(self.new_session)).pack(fill='x',pady=5)
         ttk.Label(side,text='稳定 ID · 位置（不是新生日期）').pack(anchor='w',pady=(12,3))
+        self.region_filter=ttk.Combobox(side,state='readonly',values=('全部区域',*REGIONS),width=28);self.region_filter.current(0);self.region_filter.pack(fill='x')
+        self.region_filter.bind('<<ComboboxSelected>>',lambda e:self.refresh_moles())
+        self.show_inactive=tk.BooleanVar()
+        ttk.Checkbutton(side,text='显示未纳入 / 已归档 ID',variable=self.show_inactive,command=self.refresh_moles).pack(anchor='w')
         self.mole_list=tk.Listbox(side,width=30,height=8,exportselection=False);self.mole_list.pack(fill='both',expand=True)
         self.mole_list.bind('<<ListboxSelect>>',lambda e:self.safe(self.select_mole))
         row=ttk.Frame(side);row.pack(fill='x',pady=5)
         ttk.Button(row,text='＋ 新记录',command=lambda:self.safe(self.add_mole)).pack(side='left')
         ttk.Button(row,text='修改位置',command=lambda:self.safe(self.edit_mole)).pack(side='left')
         ttk.Button(side,text='下一处未记录 / 待重拍',command=lambda:self.safe(self.next_pending)).pack(fill='x')
+        ttk.Button(side,text='定位概览 / 纳入与归档',command=lambda:self.safe(self.tracking_dialog)).pack(fill='x')
+        ttk.Button(side,text='查看已关联定位概览',command=lambda:self.safe(self.show_overview)).pack(fill='x')
         ttk.Label(side,text='本月照片 · 概览用于定位，近照用于数值').pack(anchor='w',pady=(10,3))
         self.photo_list=tk.Listbox(side,height=5,exportselection=False);self.photo_list.pack(fill='both',expand=True)
         self.photo_list.bind('<<ListboxSelect>>',lambda e:self.safe(self.select_photo))
+        ttk.Button(side,text='缩略图选片',command=lambda:self.safe(self.pick_photo)).pack(fill='x')
         row=ttk.Frame(side);row.pack(fill='x',pady=5)
         ttk.Button(row,text='导入概览',command=lambda:self.safe(lambda:self.import_photos('overview'))).pack(side='left')
         ttk.Button(row,text='导入近照',command=lambda:self.safe(lambda:self.import_photos('detail'))).pack(side='left')
-        main=ttk.Frame(self.editor);main.pack(side='left',fill='both',expand=True)
+        main=ttk.Frame(self.editor_body);main.pack(side='left',fill='both',expand=True)
         bar=ttk.Frame(main);bar.pack(fill='x')
         self.mode=ttk.Combobox(bar,values=MODE_NAMES,state='readonly',width=25);self.mode.current(0);self.mode.pack(side='left')
         self.mode.bind('<<ComboboxSelected>>',lambda e:self.safe(self.change_mode))
-        for label,command in [('完成多边形',lambda:self.canvas.finish()),('撤销',lambda:self.canvas.undo()),('−',lambda:self.canvas.zoom(.8)),('＋',lambda:self.canvas.zoom(1.25)),('适合',lambda:self.canvas.fit())]:
+        for label,command in [('完成',lambda:self.canvas.finish()),('撤销',lambda:self.canvas.undo()),('重做',lambda:self.canvas.redo()),('删点',lambda:self.canvas.delete_vertex()),('旋转',lambda:self.canvas.rotate()),('−',lambda:self.canvas.zoom(.8)),('＋',lambda:self.canvas.zoom(1.25)),('适合',lambda:self.canvas.fit())]:
             ttk.Button(bar,text=label,command=command).pack(side='left',padx=2)
-        ttk.Label(main,text='左键逐点标记，完成多边形；色卡用拖动矩形。浏览模式拖动平移。原始方向显示，不自动旋转。').pack(anchor='w',pady=5)
-        self.canvas=PhotoCanvas(main,self.mark_dirty);self.canvas.pack(fill='both',expand=True)
+        ttk.Label(main,text='拖动白点调整；Delete 删点，Ctrl+Z/Y 撤销/重做，Enter 完成。旋转仅改变显示，标记始终保存原图坐标。').pack(anchor='w',pady=5)
+        self.canvas=PhotoCanvas(main,self.mark_dirty,self.executor);self.canvas.pack(fill='both',expand=True)
         controls=ttk.Frame(main);controls.pack(fill='x',pady=6)
         self.profile_label=tk.StringVar(value='未载入参考配置：只能保存照片，不能生成可比较数值')
         ttk.Button(controls,text='设置实体色卡',command=lambda:self.safe(lambda:open_reference_wizard(self.root,self.use_profile))).pack(side='left')
@@ -298,6 +248,7 @@ class App:
         self.history.pack(fill='x',pady=8)
         bar=ttk.Frame(self.review);bar.pack(fill='x')
         ttk.Button(bar,text='对比所选两条',command=lambda:self.safe(self.compare)).pack(side='left')
+        ttk.Button(bar,text='联动缩放 / 原图对比',command=lambda:self.safe(lambda:interactive_compare(self))).pack(side='left',padx=4)
         ttk.Button(bar,text='载入所选标记，另存新观察',command=lambda:self.safe(self.load_observation)).pack(side='left',padx=6)
         ttk.Button(bar,text='纠正所选观察的身份',command=lambda:self.safe(self.correct)).pack(side='left')
         self.comparison=tk.StringVar(value='请先在工作台选择一个稳定 ID')
@@ -344,10 +295,16 @@ class App:
     def require_session(self):
         if not self.session:raise ValueError('请先新建或选择月份')
         return self.session
+    def tracking_dialog(self):return workflow_ui.tracking_dialog(self)
+    def show_overview(self):return workflow_ui.show_overview(self)
+    def pick_photo(self,page=0):return workflow_ui.pick_photo(self,page)
     def refresh_moles(self):
         self.mole_rows=self.store.moles();self.mole_list.delete(0,'end')
+        active={m['id'] for m in self.store.active_moles(self.session)} if self.session else {m['id'] for m in self.mole_rows}
+        region=self.region_filter.get()
+        self.mole_rows=[m for m in self.mole_rows if m['id']==self.mole or ((self.show_inactive.get() or m['id'] in active) and (region=='全部区域' or m['region']==region))]
         statuses=self.store.monthly_status(self.session) if self.session else {}
-        for row in self.mole_rows:self.mole_list.insert('end',row['id'][:8]+' · '+row['location']+' · '+STATUS_NAMES.get(statuses.get(row['id']),'本月未记录'))
+        for row in self.mole_rows:self.mole_list.insert('end',row['id'][:8]+' · '+row['location']+' · '+(STATUS_NAMES.get(statuses.get(row['id']),'本月未记录') if row['id'] in active else '本月未纳入 / 已归档'))
         if self.mole:
             for i,row in enumerate(self.mole_rows):
                 if row['id']==self.mole:self.mole_list.selection_set(i)
@@ -360,7 +317,8 @@ class App:
     def next_pending(self):
         self.require_session()
         statuses=self.store.monthly_status(self.session)
-        indices=[i for i,row in enumerate(self.mole_rows) if statuses.get(row['id']) in (None,'retake')]
+        active={m['id'] for m in self.store.active_moles(self.session)}
+        indices=[i for i,row in enumerate(self.mole_rows) if row['id'] in active and statuses.get(row['id']) in (None,'retake')]
         if not indices:raise ValueError('本月所有 ID 已有记录；请继续核对覆盖清单')
         current=next((i for i,row in enumerate(self.mole_rows) if row['id']==self.mole),-1)
         index=next((i for i in indices if i>current),indices[0])
@@ -381,7 +339,7 @@ class App:
             if existing:
                 self.store.edit_mole(existing['id'],region.get(),entry.get())
             else:
-                new_id=self.store.add_mole(region.get(),entry.get())
+                new_id=self.store.add_mole(region.get(),entry.get(),self.month_combo.get() or date.today().strftime('%Y-%m'))
                 self.reset_marks()
                 self.mole=new_id
             dialog.destroy()
@@ -395,7 +353,7 @@ class App:
         if row:self.mole_dialog(row)
     def refresh_photos(self):
         self.photo_rows=self.store.photos(self.session);self.photo_list.delete(0,'end')
-        for i,row in enumerate(self.photo_rows):self.photo_list.insert('end',f'{i+1:02d} · {"近照" if row["role"]=="detail" else "概览"} · {row["width"]}×{row["height"]}')
+        for i,row in enumerate(self.photo_rows):self.photo_list.insert('end',f'{i+1:02d} · {"近照" if row["role"]=="detail" else "概览"} · {row["filename"]} · {row["width"]}×{row["height"]}')
         if self.photo:
             for i,r in enumerate(self.photo_rows):
                 if r['id']==self.photo:self.photo_list.selection_set(i)
@@ -408,6 +366,7 @@ class App:
             store=Store(data_root);count=0;errors=[]
             try:
                 for file in files:
+                    self.progress('导入照片',count,len(files))
                     try:store.import_photo(file,session,role);count+=1
                     except (ValueError,OSError) as exc:errors.append(Path(file).name+'：'+str(exc))
                 return count,errors
@@ -425,17 +384,23 @@ class App:
         if not self.discard():
             self.refresh_photos()
             return
-        try:
-            self.canvas.load(self.store.photo_path(row['id']))
-        except Exception:
-            self.dirty=dirty
-            self.refresh_photos()
-            raise
-        self.photo=row['id']
-        self.reset_qc()
+        session,mole=self.session,self.mole;data_root=self.store.root
+        def work():
+            store=Store(data_root)
+            try:
+                self.progress('校验并读取原件')
+                prepared=prepare_photo(store.photo_path(row['id']))
+                self.progress('准备显示')
+                return prepared
+            finally:store.close()
+        def complete(prepared):
+            if (self.session,self.mole)!=(session,mole):return
+            self.canvas.set_prepared(prepared);self.photo=row['id'];self.reset_qc();self.refresh_photos()
+            self.status.set('已打开 '+row['filename']+'；请核对身份并标记。')
+        self.run_job('打开照片',work,complete)
 
     def clear_canvas(self):
-        self.canvas.original=None;self.canvas.canvas.delete('all');self.canvas.masks={};self.canvas.points=[];self.reset_qc()
+        self.canvas.clear();self.reset_qc()
     def reset_qc(self):
         for var in self.qc:
             var.set(False)
@@ -444,7 +409,7 @@ class App:
         self.notes.delete('1.0','end');self.dirty=False
     def reset_marks(self,keep_patches=False):
         patches=self.canvas.masks.get('patches',[]) if keep_patches else []
-        self.canvas.masks={'mole':[],'skin':[],'exclude':[],'patches':patches};self.canvas.points=[];self.canvas.outlines();self.reset_qc()
+        self.canvas.masks={'mole':[],'skin':[],'exclude':[],'patches':patches};self.canvas.points=[];self.canvas.reset_history();self.canvas.outlines();self.reset_qc()
     def load_profile(self):
         path=filedialog.askopenfilename(parent=self.root,filetypes=[('JSON reference profile','*.json')])
         if not path:return
@@ -456,6 +421,7 @@ class App:
         reference_xyz(profile)
         self.qc[2].set(False)
         self.canvas.masks['patches']=[]
+        self.canvas.reset_history()
         self.canvas.patch_names=profile.get('patch_ids',[])
         self.canvas.outlines()
         self.profile=profile
@@ -473,6 +439,8 @@ class App:
         self.require_session()
         if not self.mole or not self.photo:raise ValueError('请选择稳定 ID 和本月照片')
         if self.canvas.points:raise ValueError('请先完成多边形或撤销未完成的点')
+        if self.mole not in {m['id'] for m in self.store.active_moles(self.session)}:
+            raise ValueError('此 ID 本月未纳入或已归档，请先确认追踪范围。')
     def record(self,measurement,status,notes):
         masks=json.loads(json.dumps(self.canvas.masks));masks['coordinate_system']='original-unrotated-raster'
         masks['capture_context']={'srgb_assumed':self.srgb.get(),'ordinary_skin':self.ordinary.get()}
@@ -486,12 +454,15 @@ class App:
         path=self.store.photo_path(self.photo);srgb=self.srgb.get();ordinary=self.ordinary.get()
         masks=json.loads(json.dumps(self.canvas.masks));profile=self.profile;notes=self.notes.get('1.0','end').strip()
         def work():
+            self.progress('读取分析像素')
             image,space=analysis_image(path,srgb)
             size=(image.shape[1],image.shape[0]);exclude=masks.get('exclude',[])
             mole=polygon_mask(size,masks.get('mole',[]),exclude)
             skin=polygon_mask(size,masks.get('skin',[]),exclude) if ordinary else None
             fit=fit_reference(patch_medians(image,masks.get('patches',[])),profile)
+            self.progress('计算所选区域')
             result=measure(image,mole,skin,fit,ordinary);result['color_source']=space;result['manual_qc']=[True]*4
+            self.progress('分析完成，准备保存')
             return result
         self.run_job('分析所选区域',work,lambda result:self.record(result,'comparable',notes))
     def save_photo_only(self):
@@ -504,7 +475,8 @@ class App:
     def refresh_coverage(self):
         for region,state in self.store.coverage(self.session).items():self.cover_vars[region].current(COVERAGE.index(state))
         missing=self.store.missing(self.session)
-        statuses=list(self.store.monthly_status(self.session).values())
+        active={m['id'] for m in self.store.active_moles(self.session)}
+        statuses=[status for mole,status in self.store.monthly_status(self.session).items() if mole in active]
         locations={m['id']:m['location'] for m in self.store.moles()}
         self.cover_summary.set(f'已登记 {len(locations)} 个稳定 ID；本月尚无照片观察 {len(missing)} 个：'+', '.join(locations[m] for m in missing)+'\n本月每个 ID 最新状态：'+', '.join(f'{label}: {statuses.count(status)}' for status,label in STATUS_NAMES.items())+'\n已有照片也可能仍需要重拍，不等于已获得可比较记录。')
     def refresh_history(self):
@@ -515,6 +487,9 @@ class App:
         for row in self.history_rows:
             m=row['measurement'] or {};value=lambda k:'—' if m.get(k) is None else f'{m[k]:.2f}'
             self.history.insert('','end',iid=row['id'],values=(row['month'],STATUS_NAMES[row['status']],value('mole_l'),value('skin_l'),value('d'),row['notes']))
+        latest={row['month']:row for row in self.history_rows}
+        selected=list(latest.values())[-2:]
+        if selected:self.history.selection_set([row['id'] for row in selected]);self.history.see(selected[-1]['id'])
     def history_selected(self,count):
         ids=self.history.selection()
         if len(ids)!=count:raise ValueError(f'请选择 {count} 条观察记录')
@@ -598,7 +573,7 @@ class App:
         data_root=self.store.root
         def work():
             store=Store(data_root)
-            try:store.backup(path)
+            try:store.backup(path,self.progress)
             finally:store.close()
         self.run_job(f'备份 {capacity["photos"]} 份原件（{capacity["original_bytes"]/1024**3:.2f} GiB，上限 16 GiB）',work,
                      lambda _:self.status.set('本地备份完成，包含全部原件、历史和恢复草稿。未加密，未上传。'))
@@ -611,8 +586,13 @@ class App:
         if not name:return
         if name in ('.','..') or '/' in name or '\\' in name:raise ValueError('请输入单一文件夹名称')
         destination=Path(parent)/name
-        self.run_job('恢复备份',lambda:restore_backup(source,destination),
-                     lambda _:messagebox.showinfo('恢复成功','副本已恢复。使用 python -m moletracker --data <恢复目录> 打开；当前资料未覆盖。',parent=self.root))
+        def complete(_):
+            self.status.set('恢复副本已完成：'+str(destination))
+            if messagebox.askyesno('恢复成功','副本已校验恢复。现在打开恢复副本吗？',parent=self.root):
+                command=[sys.executable]
+                if not getattr(sys,'frozen',False):command+=['-m','moletracker']
+                subprocess.Popen(command+['--data',str(destination)],cwd=str(Path(__file__).parents[1]),creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+        self.run_job('恢复备份',lambda:restore_backup(source,destination,self.progress),complete)
     def guide(self):
         dialog=tk.Toplevel(self.root);dialog.title('拍摄协议与边界');dialog.geometry('850x650')
         widget=tk.Text(dialog,wrap='word',padx=18,pady=18);widget.pack(fill='both',expand=True)
@@ -623,7 +603,9 @@ class App:
         return path.read_text(encoding='utf-8') if path.exists() else '详细协议随源代码 docs/CAPTURE_PROTOCOL.md 提供。'
     def close(self):
         if self.busy:
-            self.status.set('任务仍在进行，请完成后再关闭窗口。');return
+            if messagebox.askyesno('任务正在进行','停止当前任务，并在保存草稿后退出？已完成的导入会保留。',parent=self.root):
+                self.close_after_job=True;self.cancel_job()
+            return
         if self.discard():
             self.executor.shutdown(wait=True);self.store.close();self.root.destroy()
 
@@ -631,4 +613,11 @@ class App:
 def main():
     parser=argparse.ArgumentParser(description='Offline manual mole photo journal')
     parser.add_argument('--data',type=Path,default=Path.home()/'.moletracker',help='Local non-synced data directory')
-    args=parser.parse_args();root=tk.Tk();App(root,Store(args.data));root.mainloop()
+    args=parser.parse_args();root=tk.Tk();lock=None
+    try:
+        lock=InstanceLock(args.data)
+        App(root,Store(args.data));root.mainloop()
+    except (ValueError,OSError) as exc:
+        messagebox.showerror('无法打开资料',str(exc),parent=root);root.destroy()
+    finally:
+        if lock:lock.close()

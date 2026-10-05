@@ -15,6 +15,12 @@ A private, offline, manual monthly photo journal for approximately 20–30 ident
 - Recovery drafts remain separate from observations and require renewed human QC; latest monthly status guides missing/retake navigation
 - User-started import, analysis, backup and restore run in a background worker while editor state is locked; this does not schedule automatic backups
 - Cross-platform Python launch instructions; OS tests clearly separated from assumptions
+- Original filenames, paged thumbnail selection, region filtering and explicit overview association
+- Tracking start/archive months separate from appearance dates; new IDs do not retroactively add earlier-month omissions
+- Original-coordinate vertex/rectangle editing, undo/redo and reversible display rotation
+- Linked visual comparison with notes and pixel display ratios, without physical-size claims
+- Lightweight drafts, stale-render protection, cooperative task cancellation, new-copy opening and per-directory interactive-instance lock
+- Scrollable editor access on smaller windows; old database/backup reading and explicit newer-format refusal by old software
 
 ## Deliberate first-version limits
 No automatic lesion detector, automatic identity matching, registration, physical area/diameter estimation, calibrated clinical interpretation, mobile app, automatic photo acquisition, remote account, or background backup. Manual visual QC is mandatory; automated checks cannot certify absence of blur, local tone mapping or shadow. A real capture trial is needed to establish whether capture + import + review takes under one hour.

@@ -112,3 +112,34 @@ def _geometry(masks,measurement,size):
             raise ValueError('皮肤掩膜与测量像素来源不一致')
         if len(rectangles) != len(measurement['fit']['patch_rgb']):
             raise ValueError('参考框与测量来源不一致')
+
+
+def validate_draft_geometry(masks, size):
+    """Bounded, allocation-free structure gate; unfinished editing is allowed."""
+    if not isinstance(masks, dict) or masks.get('coordinate_system', 'original-unrotated-raster') != 'original-unrotated-raster':
+        raise ValueError('草稿坐标系无效')
+    if 'capture_context' in masks:
+        context=masks['capture_context']
+        if not isinstance(context,dict) or set(context)!={'srgb_assumed','ordinary_skin'} or any(type(v) is not bool for v in context.values()):
+            raise ValueError('草稿拍摄假设无效')
+    def polygon(points):
+        if not isinstance(points, list) or len(points) > 10000 or 0<len(points)<3:
+            raise ValueError('草稿多边形无效或点数过多')
+        for point in points:
+            if (not isinstance(point, list) or len(point) != 2 or
+                    any(type(v) not in (int, float) or not math.isfinite(v) for v in point) or
+                    not (0 <= point[0] < size[0] and 0 <= point[1] < size[1])):
+                raise ValueError('草稿多边形超出原图或坐标无效')
+    for key in ('mole', 'skin'):
+        polygon(masks.get(key, []))
+    exclusions = masks.get('exclude', [])
+    patches = masks.get('patches', [])
+    if not isinstance(exclusions, list) or not isinstance(patches, list) or len(exclusions) + len(patches) > 1000:
+        raise ValueError('草稿区域数量无效')
+    for points in exclusions:
+        polygon(points)
+    for rect in patches:
+        if (not isinstance(rect, list) or len(rect) != 4 or
+                any(type(v) not in (int, float) or not math.isfinite(v) for v in rect) or
+                not (0 <= rect[0] < rect[2] <= size[0] and 0 <= rect[1] < rect[3] <= size[1])):
+            raise ValueError('草稿色卡框无效')
